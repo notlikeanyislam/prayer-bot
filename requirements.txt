@@ -1,0 +1,5 @@
+python-telegram-bot[webhooks,job-queue]==22.3
+requests
+tzdata
+pymongo
+dnspython
