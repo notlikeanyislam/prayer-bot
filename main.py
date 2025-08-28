@@ -4,7 +4,7 @@ from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 import asyncio
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import requests
@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # الصلوات وأسماؤها العربية
 PRAYERS = ["Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"]
 AR_PRAYER = {"Fajr": "الفجر", "Dhuhr": "الظهر", "Asr": "العصر", "Maghrib": "المغرب", "Isha": "العشاء"}
-DURATIONS = {"Fajr": 20, "Dhuhr": 20, "Asr": 20, "Maghrib": 20, "Isha": 20}
+DURATIONS = {"Fajr": 15, "Dhuhr": 15, "Asr": 15, "Maghrib": 15, "Isha": 15}
 
 DUA_NIGHT = "بِاسْمِكَ رَبِّي وَضَعْتُ جَنْبِي، وَبِكَ أَرْفَعُهُ، فَإِنْ أَمْسَكْتَ نَفْسِي فَارْحَمْهَا، وَإِنْ أَرْسَلْتَهَا فَاحْفَظْهَا، بِمَا تَحْفَظُ بِهِ عِبَادَكَ الصَّالِحِينَ"
 DUA_MORNING = "اللَّهُمَّ إنِّي أصبَحتُ أنِّي أُشهِدُك، وأُشهِدُ حَمَلةَ عَرشِكَ، ومَلائِكَتَك، وجميعَ خَلقِكَ: بأنَّك أنتَ اللهُ لا إلهَ إلَّا أنتَ، وَحْدَك لا شريكَ لكَ، وأنَّ مُحمَّدًا عبدُكَ ورسولُكَ"
@@ -220,6 +220,191 @@ async def times_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{AR_PRAYER.get(name, name)}: {dt.strftime('%H:%M')}\n"
     await update.message.reply_text(msg)
 
+# new helper: copy a message (media or text) into a single group/topic
+async def copy_to_group(context, from_chat_id, from_message_id, dest_chat_id, dest_thread_id=None):
+    """
+    Copy a message by message_id from from_chat_id into dest_chat_id.
+    If dest_thread_id provided, will copy into that forum topic.
+    Returns (True, None) on success, (False, error_str) on failure.
+    """
+    try:
+        kwargs = {
+            "chat_id": dest_chat_id,
+            "from_chat_id": from_chat_id,
+            "message_id": from_message_id,
+        }
+        if dest_thread_id is not None:
+            kwargs["message_thread_id"] = dest_thread_id
+        await context.bot.copy_message(**kwargs)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# replacement announce_all that supports media (reply-copy) and text
+async def announce_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /announce <text>  OR reply to a message (any media) with /announce -> broadcast to all bound groups/topics
+    Owner-only and works only in private chat (DM).
+    """
+    # Ensure DM and owner
+    if update.effective_chat.type != "private":
+        return await update.message.reply_text("هذا الأمر يعمل فقط في رسائل خاصة (DM) مع البوت.")
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⚠️ فقط صاحب البوت يمكنه استعمال هذا الأمر.")
+
+    # If user replied to a message — we will copy that message (works for media)
+    if update.message.reply_to_message:
+        source_msg = update.message.reply_to_message
+        from_chat_id = source_msg.chat_id
+        from_message_id = source_msg.message_id
+
+        groups = db.get_groups_db()
+        if not groups:
+            return await update.message.reply_text("⚠️ لا توجد قروبات مرتبطة لإرسال الإعلان.")
+
+        sent = 0
+        failed = 0
+        errors = []
+        for g_str, info in list(groups.items()):
+            try:
+                dest_chat_id = int(g_str)
+            except Exception:
+                failed += 1
+                errors.append(f"bad chat id: {g_str}")
+                continue
+            dest_thread_id = info.get("thread_id")
+
+            ok, err = await copy_to_group(context, from_chat_id, from_message_id, dest_chat_id, dest_thread_id)
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+                errors.append(f"{dest_chat_id}: {err}")
+            # small delay to reduce rate-limit risks
+            await asyncio.sleep(0.07)
+
+        summary = f"📣 تم إرسال الإعلان إلى {sent} قروب(قروبات). فشل: {failed}."
+        if errors and len(errors) <= 8:
+            summary += "\n\nErrors:\n" + "\n".join(errors)
+        elif errors:
+            summary += f"\n\nErrors: {len(errors)} (use logs for details)."
+
+        return await update.message.reply_text(summary)
+
+    # Otherwise: use command text args (plain text announcement)
+    text = " ".join(context.args).strip()
+    if not text:
+        return await update.message.reply_text("⚠️ الرجاء إرسال نص الإعلان أو الرد على رسالة (وسائط أو نص) ثم استخدام /announce")
+
+    groups = db.get_groups_db()
+    if not groups:
+        return await update.message.reply_text("⚠️ لا توجد قروبات مرتبطة لإرسال الإعلان.")
+
+    sent = 0
+    failed = 0
+    for g_str, info in list(groups.items()):
+        try:
+            chat_id = int(g_str)
+        except Exception:
+            failed += 1
+            continue
+        thread_id = info.get("thread_id")
+        try:
+            if thread_id:
+                await context.bot.send_message(chat_id=chat_id, text=text, message_thread_id=thread_id)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            sent += 1
+        except Exception as e:
+            print(f"announce_all(text): failed to send to {chat_id} (thread {thread_id}): {e}")
+            failed += 1
+        await asyncio.sleep(0.06)
+
+    return await update.message.reply_text(f"📣 تم إرسال الإعلان إلى {sent} قروب(قروبات). فشل: {failed}.")
+
+# asyn------------------------ close_all -------------------------
+
+async def close_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/close_all  - owner DM only: close all topics or fallback to chat permissions"""
+    if update.effective_chat.type != "private":
+        return await update.message.reply_text("هذا الأمر يعمل فقط في رسائل خاصة (DM).")
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⚠️ فقط صاحب البوت يمكنه استعمال هذا الأمر.")
+
+    groups = db.get_groups_db()
+    if not groups:
+        return await update.message.reply_text("⚠️ لا توجد قروبات مرتبطة.")
+
+    closed = 0
+    failed = 0
+    for g_str, info in list(groups.items()):
+        try:
+            chat_id = int(g_str)
+        except Exception:
+            failed += 1
+            continue
+        thread_id = info.get("thread_id")
+        try:
+            if thread_id:
+                # try to close forum topic async
+                await context.bot.send_message(chat_id=chat_id, text="🔒 سيتم إغلاق الموضوع (إدارة مركزية).", message_thread_id=thread_id)
+                await context.bot.close_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
+                db.update_state_db(chat_id, True) 
+            else:
+                await context.bot.send_message(chat_id=chat_id, text="🔒 سيتم إغلاق الشات (إدارة مركزية).")
+                await context.bot.set_chat_permissions(chat_id=chat_id, permissions=ChatPermissions(can_send_messages=False))
+                db.update_state_db(chat_id, True) 
+            closed += 1
+        except Exception as e:
+            print(f"close_all_cmd: failed for {chat_id}/{thread_id}: {e}")
+            failed += 1
+        await asyncio.sleep(0.06)
+
+    return await update.message.reply_text(f"🔒 انتهى: تم إغلاق {closed}، فشل: {failed}.")
+
+# asyn------------------------ open_all -------------------------
+
+async def open_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/open_all - owner DM only: open all topics or restore permissions"""
+    if update.effective_chat.type != "private":
+        return await update.message.reply_text("هذا الأمر يعمل فقط في رسائل خاصة (DM).")
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⚠️ فقط صاحب البوت يمكنه استعمال هذا الأمر.")
+
+    groups = db.get_groups_db()
+    if not groups:
+        return await update.message.reply_text("⚠️ لا توجد قروبات مرتبطة.")
+
+    opened = 0
+    failed = 0
+    for g_str, info in list(groups.items()):
+        try:
+            chat_id = int(g_str)
+        except Exception:
+            failed += 1
+            continue
+        thread_id = info.get("thread_id")
+        try:
+            if thread_id:
+                await context.bot.send_message(chat_id=chat_id, text="✅ سيتم فتح الموضوع (إدارة مركزية).", message_thread_id=thread_id)
+                await context.bot.reopen_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
+                db.update_state_db(chat_id, False)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text="✅ سيتم فتح الشات (إدارة مركزية).")
+                await context.bot.set_chat_permissions(chat_id=chat_id, permissions=ChatPermissions(
+                    can_send_messages=True, can_send_media_messages=True, can_send_polls=True,
+                    can_send_other_messages=True, can_add_web_page_previews=True))
+                db.update_state_db(chat_id, False)
+            opened += 1
+        except Exception as e:
+            print(f"open_all_cmd: failed for {chat_id}/{thread_id}: {e}")
+            failed += 1
+        await asyncio.sleep(0.06)
+
+    return await update.message.reply_text(f"✅ انتهى: تم فتح {opened}، فشل: {failed}.")
+
+
+
 # تسجيل handlers وتشغيل الـ job_queue
 def main():
     application.add_handler(CommandHandler("start", start_cmd))
@@ -230,6 +415,10 @@ def main():
     application.add_handler(CommandHandler("add_admin", add_admin))
     application.add_handler(CommandHandler("remove_admin", remove_admin))
     application.add_handler(CommandHandler("times", times_cmd))
+    application.add_handler(CommandHandler("announce", announce_all))
+    application.add_handler(CommandHandler("close_all", close_all_cmd))
+    application.add_handler(CommandHandler("open_all", open_all_cmd))
+
 
     # job_queue: شغّل scheduler_job كل 60 ثانية
     application.job_queue.run_repeating(scheduler_job, interval=60, first=5)
